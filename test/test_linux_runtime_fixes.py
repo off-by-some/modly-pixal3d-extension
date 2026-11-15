@@ -2,8 +2,11 @@ import importlib.util
 import math
 import sys
 import tempfile
+import types
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 import setup
 from generator import _stage_external_images
@@ -48,6 +51,104 @@ class StageExternalImagesTests(unittest.TestCase):
             self.assertEqual(copied.read_bytes(), b"image bytes")
             self.assertEqual(staged[1:], [str(inside), None])
             self.assertEqual(_stage_external_images([str(outside)], workspace), staged[:1])
+
+
+class ReturnedLatentLifetimeTests(unittest.TestCase):
+    def test_spills_the_tracebacks_four_gib_cuda_output_without_changing_dtype(self):
+        from pixal3d_extension import runtime
+
+        shape = (1, 1024, 1024, 4, 256)
+        self.assertEqual(runtime._natten_output_size_bytes(shape, 4), 4 * 1024**3)
+        self.assertTrue(runtime._should_spill_natten_output("cuda", shape, 4))
+        self.assertFalse(runtime._should_spill_natten_output("cpu", shape, 4))
+
+    def test_strips_unused_latents_but_preserves_meshes_and_resolution(self):
+        from pixal3d_extension import runtime
+
+        meshes = [object()]
+        result = runtime._strip_returned_latents(
+            (meshes, (object(), object(), 1536))
+        )
+
+        self.assertIs(result[0], meshes)
+        self.assertEqual(result[1], (None, None, 1536))
+
+
+class PipelineMemoryPatchTests(unittest.TestCase):
+    def test_run_uses_inference_mode_offloads_models_and_drops_latents(self):
+        from pixal3d_extension import runtime
+
+        calls = []
+
+        class Model:
+            def cpu(self):
+                calls.append("model.cpu")
+                return self
+
+        class Pipeline:
+            image_cond_model_ss = Model()
+            image_cond_model_shape_512 = Model()
+            image_cond_model_shape_1024 = Model()
+            image_cond_model_tex_1024 = Model()
+            rembg_model = Model()
+
+            def cpu(self):
+                calls.append("pipeline.cpu")
+                return self
+
+            def run(self, *args, **kwargs):
+                del args, kwargs
+                calls.append("run")
+                return ["mesh"], ("shape", "texture", 1536)
+
+        class MultiViewPipeline(Pipeline):
+            def run_mv(self, *args, **kwargs):
+                del args, kwargs
+                calls.append("run_mv")
+                return ["mv-mesh"], ("mv-shape", "mv-texture", 1536)
+
+        for name in (
+            "preprocess_image", "get_proj_cond_ss", "get_proj_cond_shape",
+            "sample_sparse_structure", "sample_shape_slat", "sample_tex_slat",
+            "decode_shape_slat", "decode_tex_slat",
+        ):
+            setattr(Pipeline, name, lambda self: None)
+
+        pipeline_module = types.ModuleType("pixal3d.pipelines.pixal3d_image_to_3d")
+        pipeline_module.Pixal3DImageTo3DPipeline = Pipeline
+        pipelines_package = types.ModuleType("pixal3d.pipelines")
+        pipelines_package.Pixal3DMVImageTo3DPipeline = MultiViewPipeline
+        projection_module = types.ModuleType(
+            "pixal3d.trainers.flow_matching.mixins.image_conditioned_proj"
+        )
+
+        class ProjGrid:
+            def forward(self):
+                return None
+
+        projection_module.ProjGrid = ProjGrid
+        fake_torch = types.ModuleType("torch")
+        fake_torch.Tensor = type("Tensor", (), {})
+        fake_torch.inference_mode = nullcontext
+        with patch.dict(sys.modules, {
+            "torch": fake_torch,
+            "pixal3d.pipelines": pipelines_package,
+            "pixal3d.pipelines.pixal3d_image_to_3d": pipeline_module,
+            "pixal3d.trainers.flow_matching.mixins.image_conditioned_proj": projection_module,
+        }), patch.object(runtime, "_release_cuda_memory", side_effect=lambda: calls.append("release")):
+            runtime._install_pipeline_memory_patches()
+            pipeline = Pipeline()
+            pipeline.preprocess_image()
+            result = pipeline.run(return_latent=True)
+            mv_result = MultiViewPipeline().run_mv(return_latent=True)
+
+        self.assertEqual(result, (["mesh"], (None, None, 1536)))
+        self.assertEqual(mv_result, (["mv-mesh"], (None, None, 1536)))
+        self.assertIn("run", calls)
+        self.assertIn("run_mv", calls)
+        self.assertIn("pipeline.cpu", calls)
+        self.assertGreaterEqual(calls.count("model.cpu"), 9)
+        self.assertGreaterEqual(calls.count("release"), 5)
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for the natten fallback")

@@ -559,6 +559,7 @@ def run_multiview(
                 runtime._silence_flex_gemm_autotuners()
                 runtime._guard_mesh_fill_holes()
                 from pixal3d_extension.vendor import inference_mv
+                runtime._install_pipeline_memory_patches()
                 dino_path = str(base / "auxiliary" / "dinov3")
                 for item in inference_mv.IMAGE_COND_CONFIGS.values():
                     item["model_name"] = dino_path

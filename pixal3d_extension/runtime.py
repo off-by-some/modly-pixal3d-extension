@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import wraps
 import importlib
 import importlib.machinery
 import inspect
@@ -30,6 +31,8 @@ DEFAULT_TEXTURE_SIZE = 1024
 _TEXTURE_EXPORT_LOCK = threading.RLock()
 SUPPORTED_MANUAL_FOVS = (-1.0, 0.2, 0.35, 0.5)
 DEFAULT_MANUAL_FOV = -1.0
+_NATTEN_CPU_SPILL_THRESHOLD_BYTES = 512 * 1024 * 1024
+_NATTEN_CHUNK_TARGET_BYTES = 128 * 1024 * 1024
 SUPPORTED_RUNTIME_LANES = {
     "linux-aarch64-cp312-cuda124",
     "linux-x64-cp312-cuda124",
@@ -242,8 +245,25 @@ def _install_natten_fallback() -> None:
         # features cost ~4 GB each on top of that.
         pad_h, pad_w = padding
         bytes_per_row = bn * w * neighborhood_size * (d_qk + d_v + 2) * q.element_size()
-        rows_per_chunk = max(1, min(h, (512 * 1024 * 1024) // max(1, bytes_per_row)))
-        out = v.new_empty((b, h, w, n, d_v))
+        rows_per_chunk = max(1, min(h, _NATTEN_CHUNK_TARGET_BYTES // max(1, bytes_per_row)))
+        output_shape = (b, h, w, n, d_v)
+        output_bytes = _natten_output_size_bytes(output_shape, v.element_size())
+        spill_to_cpu = _should_spill_natten_output(v.device.type, output_shape, v.element_size())
+        if spill_to_cpu:
+            # NAF immediately projects this dense map down to sparse conditioning.
+            # Keeping its full-resolution float32 output on CUDA costs 4 GiB at
+            # the 1024 texture stage. Spill only the fallback's output storage to
+            # system RAM; computation, dtype, weights, resolution, and sampling
+            # remain unchanged. The projection compatibility patch below moves
+            # only the much smaller projected conditioning back to CUDA.
+            print(
+                f"[Pixal3D] NATTEN fallback spilling {output_bytes / 2**30:.2f} GiB output to CPU",
+                file=sys.stderr,
+                flush=True,
+            )
+            out = torch.empty(output_shape, dtype=v.dtype, device="cpu")
+        else:
+            out = v.new_empty(output_shape)
         scale = 1.0 / math.sqrt(d_qk)
         unfold_args = {"kernel_size": (kernel_h, kernel_w), "dilation": (dilation_h, dilation_w), "stride": 1}
 
@@ -283,7 +303,11 @@ def _install_natten_fallback() -> None:
             chunk = (attention.unsqueeze(-1) * v_neighbors).sum(dim=2)
             del v_neighbors, attention
             # chunk: [bn, rows*w, d_v] -> [b, rows, w, n, d_v]
-            out[:, row_start:row_end] = chunk.reshape(b, n, rows, w, d_v).permute(0, 2, 3, 1, 4)
+            chunk = chunk.reshape(b, n, rows, w, d_v).permute(0, 2, 3, 1, 4)
+            if spill_to_cpu:
+                chunk = chunk.to(device="cpu")
+            out[:, row_start:row_end] = chunk
+            del chunk
 
         return out
 
@@ -294,6 +318,206 @@ def _install_natten_fallback() -> None:
     natten_module.HAS_LIBNATTEN = False
     natten_module.na2d = na2d
     sys.modules["natten"] = natten_module
+
+
+def _natten_output_size_bytes(shape: tuple[int, ...], element_size: int) -> int:
+    return math.prod(shape) * int(element_size)
+
+
+def _should_spill_natten_output(
+    device_type: str,
+    shape: tuple[int, ...],
+    element_size: int,
+) -> bool:
+    return (
+        device_type == "cuda"
+        and _natten_output_size_bytes(shape, element_size)
+        >= _NATTEN_CPU_SPILL_THRESHOLD_BYTES
+    )
+
+
+def _release_cuda_memory() -> None:
+    """Release dead Python objects and cached CUDA blocks at stage boundaries."""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _strip_returned_latents(result: Any) -> Any:
+    """Drop decoded latents that Modly's GLB export path never consumes."""
+    if not isinstance(result, tuple) or len(result) != 2:
+        return result
+    meshes, latent_result = result
+    if not isinstance(latent_result, tuple) or len(latent_result) != 3:
+        return result
+    shape_slat, tex_slat, resolution = latent_result
+    del shape_slat, tex_slat, result, latent_result
+    _release_cuda_memory()
+    return meshes, (None, None, resolution)
+
+
+def _install_cpu_spill_projection_patch() -> None:
+    """Project CPU-spilled NAF features without recreating the dense CUDA map."""
+    try:
+        import torch
+        from pixal3d.trainers.flow_matching.mixins import image_conditioned_proj
+    except ImportError:
+        return
+
+    def move(value: Any, device: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device)
+        if isinstance(value, tuple):
+            return tuple(move(item, device) for item in value)
+        if isinstance(value, list):
+            return [move(item, device) for item in value]
+        if isinstance(value, dict):
+            return {key: move(item, device) for key, item in value.items()}
+        return value
+
+    # Multi-view builds expose ProjGridMV in the same module. Its call signature
+    # differs from ProjGrid, so preserve the installed implementation verbatim
+    # and only move its tensor arguments/results across the spill boundary.
+    for class_name in ("ProjGrid", "ProjGridMV"):
+        projection_class = getattr(image_conditioned_proj, class_name, None)
+        if projection_class is None:
+            continue
+        original = projection_class.forward
+        if getattr(original, "_modly_cpu_spill", False):
+            continue
+
+        @wraps(original)
+        def forward(
+            self: Any,
+            features_map: Any,
+            *args: Any,
+            __original: Callable[..., Any] = original,
+            **kwargs: Any,
+        ) -> Any:
+            if not isinstance(features_map, torch.Tensor) or features_map.device.type != "cpu":
+                return __original(self, features_map, *args, **kwargs)
+            target_device = self.grid_points.device
+            if target_device.type == "cpu":
+                return __original(self, features_map, *args, **kwargs)
+
+            self.cpu()
+            try:
+                projected = __original(
+                    self,
+                    features_map,
+                    *move(args, "cpu"),
+                    **move(kwargs, "cpu"),
+                )
+            finally:
+                self.to(target_device)
+            _release_cuda_memory()
+            return move(projected, target_device)
+
+        forward._modly_cpu_spill = True
+        projection_class.forward = forward
+
+
+def _install_pipeline_memory_patches() -> None:
+    """Apply quality-neutral lifetime management to the installed pipeline."""
+    try:
+        import torch
+        from pixal3d.pipelines.pixal3d_image_to_3d import Pixal3DImageTo3DPipeline
+    except ImportError:
+        return
+
+    _install_cpu_spill_projection_patch()
+    pipeline_classes: list[tuple[Any, str]] = [(Pixal3DImageTo3DPipeline, "run")]
+    try:
+        from pixal3d.pipelines import Pixal3DMVImageTo3DPipeline
+
+        pipeline_classes.append((Pixal3DMVImageTo3DPipeline, "run_mv"))
+    except ImportError:
+        pass
+
+    for pipeline_class, run_name in pipeline_classes:
+        # Each method below finishes a model stage and, in low-VRAM mode, has
+        # just moved that stage's model back to CPU. Emptying the allocator here
+        # prevents dead stage blocks from overlapping the next model's live allocations.
+        for method_name in (
+            "preprocess_image",
+            "get_proj_cond_ss",
+            "get_proj_cond_shape",
+            "sample_sparse_structure",
+            "sample_shape_slat",
+            "sample_tex_slat",
+            "decode_shape_slat",
+            "decode_tex_slat",
+        ):
+            original_method = getattr(pipeline_class, method_name, None)
+            if not callable(original_method) or getattr(original_method, "_modly_memory_boundary", False):
+                continue
+
+            @wraps(original_method)
+            def boundary(
+                self: Any,
+                *args: Any,
+                __original: Callable[..., Any] = original_method,
+                __method_name: str = method_name,
+                **kwargs: Any,
+            ) -> Any:
+                try:
+                    return __original(self, *args, **kwargs)
+                finally:
+                    # Background removal is complete after preprocessing. Force
+                    # it off CUDA even in standard mode before MoGe is loaded.
+                    if __method_name == "preprocess_image":
+                        rembg_model = getattr(self, "rembg_model", None)
+                        if rembg_model is not None:
+                            rembg_model.cpu()
+                    _release_cuda_memory()
+
+            boundary._modly_memory_boundary = True
+            setattr(pipeline_class, method_name, boundary)
+
+        original_run = getattr(pipeline_class, run_name, None)
+        if not callable(original_run) or getattr(original_run, "_modly_memory_patch", False):
+            continue
+
+        @wraps(original_run)
+        def run(
+            self: Any,
+            *args: Any,
+            __original: Callable[..., Any] = original_run,
+            **kwargs: Any,
+        ) -> Any:
+            try:
+                with torch.inference_mode():
+                    result = __original(self, *args, **kwargs)
+            finally:
+                # Standard mode otherwise keeps every model resident while CuMesh
+                # builds the GLB. Low-VRAM mode is already on CPU; repeating the
+                # offload is harmless and keeps both modes consistent.
+                try:
+                    self.cpu()
+                    for attr in (
+                        "image_cond_model_ss",
+                        "image_cond_model_shape_512",
+                        "image_cond_model_shape_1024",
+                        "image_cond_model_tex_1024",
+                    ):
+                        model = getattr(self, attr, None)
+                        if model is not None:
+                            model.cpu()
+                finally:
+                    _release_cuda_memory()
+            if kwargs.get("return_latent", False):
+                result = _strip_returned_latents(result)
+            return result
+
+        run._modly_memory_patch = True
+        setattr(pipeline_class, run_name, run)
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
@@ -1045,6 +1269,7 @@ def run_job(
                 _diagnostic_checkpoint("import_inference:start")
                 inference_module = importlib.import_module("inference")
                 _patch_inference_auxiliary_sources(inference_module, auxiliary_source)
+                _install_pipeline_memory_patches()
                 run_inference = inference_module.run_inference
                 _diagnostic_checkpoint("import_inference:done")
 

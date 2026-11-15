@@ -26,6 +26,7 @@ Usage:
 """
 
 import os
+import gc
 import argparse
 import json
 import math
@@ -328,24 +329,29 @@ def run_inference(
 
     pipeline_type = f"{resolution if resolution > 0 else (1024 if low_vram else 1536)}_cascade"
     print(f"[Inference] Using pipeline_type={pipeline_type}")
-    mesh_list, (shape_slat, tex_slat, res) = pipeline.run_mv(
-        views,
-        seed=seed,
-        sparse_structure_sampler_params=ss_sampler_override,
-        shape_slat_sampler_params=shape_sampler_override,
-        tex_slat_sampler_params=tex_sampler_override,
-        return_latent=True,
-        pipeline_type=pipeline_type,
-        max_num_tokens=max_num_tokens,
-    )
+    with torch.inference_mode():
+        mesh_list, (shape_slat, tex_slat, res) = pipeline.run_mv(
+            views,
+            seed=seed,
+            sparse_structure_sampler_params=ss_sampler_override,
+            shape_slat_sampler_params=shape_sampler_override,
+            tex_slat_sampler_params=tex_sampler_override,
+            return_latent=True,
+            pipeline_type=pipeline_type,
+            max_num_tokens=max_num_tokens,
+        )
 
     mesh = mesh_list[0]
+    pbr_attr_layout = pipeline.pbr_attr_layout
+    del shape_slat, tex_slat, mesh_list, pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
 
     stage(82, "Extracting textured GLB")
     print("[Inference] Extracting GLB...")
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
+        coords=mesh.coords, attr_layout=pbr_attr_layout,
         grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=1000000, texture_size=texture_size,
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,

@@ -9,7 +9,7 @@ Model weights are downloaded through Modly Models; they are not bundled here.
 ## Install and get started
 
 1. Open **Models/Extensions → Install from GitHub** and enter:
-   `https://github.com/DrHepa/modly-pixal3d-extension`
+   `https://github.com/off-by-some/modly-pixal3d-extension`
 2. Let setup finish. If dependencies need recovery, use the extension's **Repair** action.
 3. In **Models**, download the shared weight groups for your chosen node (below).
 4. Connect your inputs in a workflow and run the node.
@@ -17,7 +17,7 @@ Model weights are downloaded through Modly Models; they are not bundled here.
 Normal setup automatically attempts the special scene-preparation and WorldSculpt
 environments on supported hosts. No separate manual setup is needed for a fresh install.
 
-**Version 0.7.3 — Windows RTX 5090 / SM120 (experimental):** normal Install/Reinstall/Repair
+**Version 0.7.4 — Windows RTX 5090 / SM120 (experimental):** normal Install/Reinstall/Repair
 keeps the checksum-pinned r3 CPython 3.11 / CUDA 12.8 native archive unchanged.
 It adds a separate MV Python overlay, a private WorldSculpt dependency overlay,
 and extension-owned CPython 3.12 + SAM3/DA3 for scene preparation and automatic

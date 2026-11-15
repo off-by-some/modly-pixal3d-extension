@@ -1,5 +1,6 @@
 import os
 import argparse
+import gc
 import math
 import time
 import torch
@@ -234,6 +235,9 @@ def run_inference(
     print(f"[Inference] Processing image: {image_path}")
     img = Image.open(image_path)
     image_preprocessed = pipeline.preprocess_image(img)
+    pipeline.rembg_model.cpu()
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Save preprocessed image for MoGe
     tmp_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), f"_tmp_preprocessed_{int(time.time()*1000)}.png")
@@ -264,6 +268,7 @@ def run_inference(
         # MoGe is only needed for camera estimation; free its VRAM for inference.
         moge_model.cpu()
         del moge_model
+        gc.collect()
         torch.cuda.empty_cache()
     os.remove(tmp_path)
 
@@ -286,26 +291,31 @@ def run_inference(
 
     pipeline_type = f"{resolution if resolution > 0 else (1024 if low_vram else 1536)}_cascade"
     print(f"[Inference] Using pipeline_type={pipeline_type}")
-    mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
-        image_preprocessed,
-        camera_params=camera_params,
-        seed=seed,
-        sparse_structure_sampler_params=ss_sampler_override,
-        shape_slat_sampler_params=shape_sampler_override,
-        tex_slat_sampler_params=tex_sampler_override,
-        preprocess_image=False,
-        return_latent=True,
-        pipeline_type=pipeline_type,
-        max_num_tokens=max_num_tokens,
-    )
+    with torch.inference_mode():
+        mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
+            image_preprocessed,
+            camera_params=camera_params,
+            seed=seed,
+            sparse_structure_sampler_params=ss_sampler_override,
+            shape_slat_sampler_params=shape_sampler_override,
+            tex_slat_sampler_params=tex_sampler_override,
+            preprocess_image=False,
+            return_latent=True,
+            pipeline_type=pipeline_type,
+            max_num_tokens=max_num_tokens,
+        )
 
     mesh = mesh_list[0]
+    pbr_attr_layout = pipeline.pbr_attr_layout
+    del shape_slat, tex_slat, mesh_list, pipeline
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Extract GLB
     print("[Inference] Extracting GLB...")
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs,
-        coords=mesh.coords, attr_layout=pipeline.pbr_attr_layout,
+        coords=mesh.coords, attr_layout=pbr_attr_layout,
         grid_size=res, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=1000000, texture_size=4096,
         remesh=True, remesh_band=1, remesh_project=0, use_tqdm=True,
