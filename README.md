@@ -17,7 +17,7 @@ Model weights are downloaded through Modly Models; they are not bundled here.
 Normal setup automatically attempts the special scene-preparation and WorldSculpt
 environments on supported hosts. No separate manual setup is needed for a fresh install.
 
-**Version 0.7.5 — Windows RTX 5090 / SM120 (experimental):** normal Install/Reinstall/Repair
+**Version 0.7.6 — Windows RTX 5090 / SM120 (experimental):** normal Install/Reinstall/Repair
 keeps the checksum-pinned r3 CPython 3.11 / CUDA 12.8 native archive unchanged.
 It adds a separate MV Python overlay, a private WorldSculpt dependency overlay,
 and extension-owned CPython 3.12 + SAM3/DA3 for scene preparation and automatic

@@ -415,7 +415,9 @@ def _install_cpu_spill_projection_patch() -> None:
     """Project CPU-spilled NAF features without recreating the dense CUDA map."""
     try:
         import torch
-        from pixal3d.trainers.flow_matching.mixins import image_conditioned_proj
+        image_conditioned_proj = importlib.import_module(
+            "pixal3d.trainers.flow_matching.mixins.image_conditioned_proj"
+        )
     except ImportError:
         return
 
@@ -472,6 +474,47 @@ def _install_cpu_spill_projection_patch() -> None:
         projection_class.forward = forward
 
 
+def _install_conditioning_memory_patches() -> None:
+    """Offload DINO after feature extraction, before NAF allocates its activations."""
+    try:
+        image_conditioned_proj = importlib.import_module(
+            "pixal3d.trainers.flow_matching.mixins.image_conditioned_proj"
+        )
+    except ImportError:
+        return
+
+    for class_name in (
+        "DinoV3ProjFeatureExtractor",
+        "DinoV3ProjMultiViewFeatureExtractor",
+    ):
+        extractor_class = getattr(image_conditioned_proj, class_name, None)
+        if extractor_class is None:
+            continue
+        original = getattr(extractor_class, "extract_features", None)
+        if not callable(original) or getattr(original, "_modly_dino_offload", False):
+            continue
+
+        @wraps(original)
+        def extract_features(
+            self: Any,
+            *args: Any,
+            __original: Callable[..., Any] = original,
+            **kwargs: Any,
+        ) -> Any:
+            features = __original(self, *args, **kwargs)
+            if getattr(self, "use_naf_upsample", False):
+                dino_model = getattr(self, "model", None)
+                if dino_model is None:
+                    dino_model = getattr(self, "dino_model", None)
+                if dino_model is not None:
+                    dino_model.cpu()
+                    _release_cuda_memory()
+            return features
+
+        extract_features._modly_dino_offload = True
+        extractor_class.extract_features = extract_features
+
+
 def _install_pipeline_memory_patches() -> None:
     """Apply quality-neutral lifetime management to the installed pipeline."""
     try:
@@ -481,6 +524,7 @@ def _install_pipeline_memory_patches() -> None:
         return
 
     _install_cpu_spill_projection_patch()
+    _install_conditioning_memory_patches()
     pipeline_classes: list[tuple[Any, str]] = [(Pixal3DImageTo3DPipeline, "run")]
     try:
         from pixal3d.pipelines import Pixal3DMVImageTo3DPipeline

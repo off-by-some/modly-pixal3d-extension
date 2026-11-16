@@ -145,6 +145,18 @@ class PipelineMemoryPatchTests(unittest.TestCase):
                 return None
 
         projection_module.ProjGrid = ProjGrid
+
+        class Extractor:
+            use_naf_upsample = True
+
+            def __init__(self):
+                self.model = Model()
+
+            def extract_features(self, image):
+                calls.append("extract_features")
+                return image
+
+        projection_module.DinoV3ProjFeatureExtractor = Extractor
         fake_torch = types.ModuleType("torch")
         fake_torch.Tensor = type("Tensor", (), {})
         fake_torch.inference_mode = nullcontext
@@ -159,14 +171,17 @@ class PipelineMemoryPatchTests(unittest.TestCase):
             pipeline.preprocess_image()
             result = pipeline.run(return_latent=True)
             mv_result = MultiViewPipeline().run_mv(return_latent=True)
+            extracted = Extractor().extract_features("features")
 
         self.assertEqual(result, (["mesh"], (None, None, 1536)))
         self.assertEqual(mv_result, (["mv-mesh"], (None, None, 1536)))
         self.assertIn("run", calls)
         self.assertIn("run_mv", calls)
+        self.assertEqual(extracted, "features")
+        self.assertIn("extract_features", calls)
         self.assertIn("pipeline.cpu", calls)
-        self.assertGreaterEqual(calls.count("model.cpu"), 9)
-        self.assertGreaterEqual(calls.count("release"), 5)
+        self.assertGreaterEqual(calls.count("model.cpu"), 10)
+        self.assertGreaterEqual(calls.count("release"), 6)
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for the natten fallback")
