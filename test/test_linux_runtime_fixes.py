@@ -62,6 +62,24 @@ class ReturnedLatentLifetimeTests(unittest.TestCase):
         self.assertTrue(runtime._should_spill_natten_output("cuda", shape, 4))
         self.assertFalse(runtime._should_spill_natten_output("cpu", shape, 4))
 
+    def test_texture_fallback_tiles_columns_instead_of_allocating_a_full_row(self):
+        from pixal3d_extension import runtime
+
+        # Representative 1024 texture-stage dimensions. The old row-only
+        # fallback could not go below a full 1024-column allocation.
+        bytes_per_position = 4 * 81 * (2 * 1024 + 2 * 256 + 2) * 4
+        tile_height, tile_width = runtime._natten_tile_shape(
+            1024, 1024, bytes_per_position
+        )
+
+        self.assertEqual(tile_height, 1)
+        self.assertGreater(tile_width, 1)
+        self.assertLess(tile_width, 1024)
+        self.assertLessEqual(
+            tile_height * tile_width * bytes_per_position,
+            runtime._NATTEN_CHUNK_TARGET_BYTES,
+        )
+
     def test_strips_unused_latents_but_preserves_meshes_and_resolution(self):
         from pixal3d_extension import runtime
 

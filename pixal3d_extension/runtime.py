@@ -239,13 +239,17 @@ def _install_natten_fallback() -> None:
         neighborhood_size = kernel_h * kernel_w
         padding = ((kernel_h // 2) * dilation_h, (kernel_w // 2) * dilation_w)
 
-        # Process output rows in chunks, slicing q/k/v in place: unfolding the
-        # whole image at once materialises every neighbourhood (~20 GB for NAF's
-        # 9x9 windows), and full-size permuted/padded copies of NAF's texture
-        # features cost ~4 GB each on top of that.
+        # Process output in two-dimensional tiles, slicing q/k/v in place.
+        # Row-only chunks still have a full-width minimum allocation: for the
+        # 1024 texture stage even one padded row can cost 146 MiB before unfold.
+        # Tiling columns as well removes that minimum while preserving exactly
+        # the same neighbourhoods and border mask.
         pad_h, pad_w = padding
-        bytes_per_row = bn * w * neighborhood_size * (d_qk + d_v + 2) * q.element_size()
-        rows_per_chunk = max(1, min(h, _NATTEN_CHUNK_TARGET_BYTES // max(1, bytes_per_row)))
+        # The broadcasted dot products temporarily coexist with their unfolded
+        # K/V neighbourhoods. Count both sides so the target describes peak
+        # live storage rather than only the final unfolded tensors.
+        bytes_per_position = bn * neighborhood_size * (2 * d_qk + 2 * d_v + 2) * q.element_size()
+        tile_h, tile_w = _natten_tile_shape(h, w, bytes_per_position)
         output_shape = (b, h, w, n, d_v)
         output_bytes = _natten_output_size_bytes(output_shape, v.element_size())
         spill_to_cpu = _should_spill_natten_output(v.device.type, output_shape, v.element_size())
@@ -267,47 +271,84 @@ def _install_natten_fallback() -> None:
         scale = 1.0 / math.sqrt(d_qk)
         unfold_args = {"kernel_size": (kernel_h, kernel_w), "dilation": (dilation_h, dilation_w), "stride": 1}
 
-        def to_heads(x: torch.Tensor, d: int, rows: int) -> torch.Tensor:
-            return x.permute(0, 3, 4, 1, 2).reshape(bn, d, rows, w)
+        def to_heads(x: torch.Tensor, d: int, rows: int, columns: int) -> torch.Tensor:
+            return x.permute(0, 3, 4, 1, 2).reshape(bn, d, rows, columns)
 
-        for row_start in range(0, h, rows_per_chunk):
-            row_end = min(h, row_start + rows_per_chunk)
+        for row_start in range(0, h, tile_h):
+            row_end = min(h, row_start + tile_h)
             rows = row_end - row_start
-            src_start = max(0, row_start - pad_h)
-            src_end = min(h, row_end + pad_h)
-            pad = (pad_w, pad_w, src_start - (row_start - pad_h), (row_end + pad_h) - src_end)
+            src_row_start = max(0, row_start - pad_h)
+            src_row_end = min(h, row_end + pad_h)
+            src_rows = src_row_end - src_row_start
 
-            q_dense = to_heads(q[:, row_start:row_end], d_qk, rows).reshape(bn, d_qk, rows * w).transpose(1, 2)
-            k_chunk = torch_functional.pad(to_heads(k[:, src_start:src_end], d_qk, src_end - src_start), pad)
-            k_neighbors = torch_functional.unfold(k_chunk, **unfold_args).reshape(
-                bn, d_qk, neighborhood_size, rows * w
-            ).permute(0, 3, 2, 1)
-            del k_chunk
-            ones_chunk = torch_functional.pad(
-                torch.ones((1, 1, src_end - src_start, w), device=q.device, dtype=q.dtype), pad
-            )
-            valid_neighbors = torch_functional.unfold(ones_chunk, **unfold_args).reshape(
-                1, neighborhood_size, rows * w
-            ).transpose(1, 2) > 0
+            for column_start in range(0, w, tile_w):
+                column_end = min(w, column_start + tile_w)
+                columns = column_end - column_start
+                src_column_start = max(0, column_start - pad_w)
+                src_column_end = min(w, column_end + pad_w)
+                src_columns = src_column_end - src_column_start
+                pad = (
+                    src_column_start - (column_start - pad_w),
+                    (column_end + pad_w) - src_column_end,
+                    src_row_start - (row_start - pad_h),
+                    (row_end + pad_h) - src_row_end,
+                )
+                positions = rows * columns
 
-            scores = (q_dense.unsqueeze(2) * k_neighbors).sum(dim=-1) * scale
-            del k_neighbors, q_dense
-            scores = scores.masked_fill(~valid_neighbors, torch.finfo(scores.dtype).min)
-            attention = torch.softmax(scores, dim=-1)
-            del scores
-            v_chunk = torch_functional.pad(to_heads(v[:, src_start:src_end], d_v, src_end - src_start), pad)
-            v_neighbors = torch_functional.unfold(v_chunk, **unfold_args).reshape(
-                bn, d_v, neighborhood_size, rows * w
-            ).permute(0, 3, 2, 1)
-            del v_chunk
-            chunk = (attention.unsqueeze(-1) * v_neighbors).sum(dim=2)
-            del v_neighbors, attention
-            # chunk: [bn, rows*w, d_v] -> [b, rows, w, n, d_v]
-            chunk = chunk.reshape(b, n, rows, w, d_v).permute(0, 2, 3, 1, 4)
-            if spill_to_cpu:
-                chunk = chunk.to(device="cpu")
-            out[:, row_start:row_end] = chunk
-            del chunk
+                q_dense = to_heads(
+                    q[:, row_start:row_end, column_start:column_end],
+                    d_qk,
+                    rows,
+                    columns,
+                ).reshape(bn, d_qk, positions).transpose(1, 2)
+                k_chunk = torch_functional.pad(
+                    to_heads(
+                        k[:, src_row_start:src_row_end, src_column_start:src_column_end],
+                        d_qk,
+                        src_rows,
+                        src_columns,
+                    ),
+                    pad,
+                )
+                k_neighbors = torch_functional.unfold(k_chunk, **unfold_args).reshape(
+                    bn, d_qk, neighborhood_size, positions
+                ).permute(0, 3, 2, 1)
+                del k_chunk
+                ones_chunk = torch_functional.pad(
+                    torch.ones((1, 1, src_rows, src_columns), device=q.device, dtype=q.dtype),
+                    pad,
+                )
+                valid_neighbors = torch_functional.unfold(ones_chunk, **unfold_args).reshape(
+                    1, neighborhood_size, positions
+                ).transpose(1, 2) > 0
+                del ones_chunk
+
+                scores = (q_dense.unsqueeze(2) * k_neighbors).sum(dim=-1) * scale
+                del k_neighbors, q_dense
+                scores.masked_fill_(~valid_neighbors, torch.finfo(scores.dtype).min)
+                del valid_neighbors
+                attention = torch.softmax(scores, dim=-1)
+                del scores
+                v_chunk = torch_functional.pad(
+                    to_heads(
+                        v[:, src_row_start:src_row_end, src_column_start:src_column_end],
+                        d_v,
+                        src_rows,
+                        src_columns,
+                    ),
+                    pad,
+                )
+                v_neighbors = torch_functional.unfold(v_chunk, **unfold_args).reshape(
+                    bn, d_v, neighborhood_size, positions
+                ).permute(0, 3, 2, 1)
+                del v_chunk
+                chunk = (attention.unsqueeze(-1) * v_neighbors).sum(dim=2)
+                del v_neighbors, attention
+                chunk = chunk.reshape(b, n, rows, columns, d_v).permute(0, 2, 3, 1, 4)
+                if spill_to_cpu:
+                    chunk = chunk.to(device="cpu")
+                out[:, row_start:row_end, column_start:column_end] = chunk
+                del chunk
 
         return out
 
@@ -322,6 +363,13 @@ def _install_natten_fallback() -> None:
 
 def _natten_output_size_bytes(shape: tuple[int, ...], element_size: int) -> int:
     return math.prod(shape) * int(element_size)
+
+
+def _natten_tile_shape(height: int, width: int, bytes_per_position: int) -> tuple[int, int]:
+    positions = max(1, _NATTEN_CHUNK_TARGET_BYTES // max(1, bytes_per_position))
+    tile_width = max(1, min(width, positions))
+    tile_height = max(1, min(height, positions // tile_width))
+    return tile_height, tile_width
 
 
 def _should_spill_natten_output(
